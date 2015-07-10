@@ -1,0 +1,849 @@
+#!/usr/bin/perl -Tw
+#
+# Equilibria -- A Simple Load-Balancing Socket Proxy
+#
+# Copyright (C) 2000-2015, Michael E. Jennings <mej@eterm.org>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies of the Software, its documentation and marketing & publicity
+# materials, and acknowledgment shall be given in the documentation, materials
+# and software packages that this Software was used.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# $Id: equilibria 345 2008-10-13 14:58:06Z mej $
+#
+
+use Data::Dumper;
+use Getopt::Long;
+use IO::Socket;
+use IO::Select;
+use Socket;
+use POSIX;
+
+my ($PROGNAME, $VERSION) = ("equilibria", "1.0");
+my $CONFIG_FILE = "/etc/$PROGNAME/$PROGNAME.conf";
+my ($DEBUG, $LOGFILE, $SOCKETDIR) = (0, "", "");
+my %OPTION;
+my %data;
+
+#################### Mezzanine::Util 1.70 (2008-09-18) ######################
+# Debugging output
+sub
+dprintf(@)
+{
+    my ($f, $l, $s, $format);
+    my @params = @_;
+
+    return if (! $DEBUG);
+    $format = shift @params;
+    if (!scalar(@params)) {
+        return dprint($format);
+    }
+    (undef, undef, undef, $s) = caller(1);
+    if (!defined($s)) {
+        $s = "MAIN";
+    }
+    (undef, $f, $l) = caller(0);
+    $f =~ s/^.*\/([^\/]+)$/$1/;
+    $s =~ s/^\w+:://g;
+    $s .= "()" if ($s =~ /^\w+$/);
+    $f = "" if (!defined($f));
+    $l = "" if (!defined($l));
+    $format = "" if (!defined($format));
+    for (my $i = 0; $i < scalar(@params); $i++) {
+        if (!defined($params[$i])) {
+            $params[$i] = "<undef>";
+        }
+    }
+    printf("[$f/$l/$s] $format", @params);
+}
+
+sub
+dprint(@)
+{
+    my ($f, $l, $s);
+    my @params = @_;
+
+    return if (! $DEBUG);
+    (undef, undef, undef, $s) = caller(1);
+    if (!defined($s)) {
+        $s = "MAIN";
+    }
+    (undef, $f, $l) = caller(0);
+    $f =~ s/^.*\/([^\/]+)$/$1/;
+    $s =~ s/\w+:://g;
+    $s .= "()" if ($s =~ /^\w+$/);
+    $f = "" if (!defined($f));
+    $l = "" if (!defined($l));
+    $s = "" if (!defined($s));
+    for (my $i = 0; $i < scalar(@params); $i++) {
+        if (!defined($params[$i])) {
+            $params[$i] = "<undef>";
+        }
+    }
+    print "[$$:$f/$l/$s] ", @params;
+}
+
+# Print an error
+sub
+eprintf(@)
+{
+    print "$PROGNAME\[$$]:  Error:  ";
+    printf @_;
+}
+sub
+eprint(@)
+{
+    print "$PROGNAME\[$$]:  Error:  ", @_;
+}
+
+# Print a warning
+sub
+wprintf(@)
+{
+    print "$PROGNAME\[$$]:  Warning:  ";
+    printf @_;
+}
+sub
+wprint(@)
+{
+    print "$PROGNAME\[$$]:  Warning:  ", @_;
+}
+
+# Handle a perl warning
+sub
+handle_warning(@)
+{
+    if ($_[0] !~ /^Name \"\S+::opt_\w+\" used only once/) {
+        dprint @_;
+    }
+    if ($_[0] =~ /^Deep recursion/) {
+        &show_backtrace();
+        &fatal_error("Aborting program due to excessive recursion.\n");
+    }
+}
+BEGIN {
+    # Take care of this ASAP at load time....
+    $SIG{__WARN__} = \&handle_warning;
+}
+
+# Create a stack trace
+sub
+get_backtrace()
+{
+    my $start = shift || 1;
+    my ($file, $line, $subroutine);
+    my (@trace, @tmp);
+
+    for (my $i = $start; @tmp = caller($i); $i++) {
+        $subroutine = $tmp[3];
+        (undef, $file, $line) = caller($i - 1);
+        $file =~ s/^.*\/([^\/]+)$/$1/;
+        push @trace, sprintf("%s\[%d\] $subroutine() at $file:$line\n",  ' ' x $i, $i - $start);
+    }
+    return @trace;
+}
+
+# Print a stack trace
+sub
+show_backtrace()
+{
+    my ($file, $line, $subroutine, $i);
+    my @tmp;
+
+    print "\n\nSTACK TRACE:\n";
+    print "------------\n";
+    print &get_backtrace(2);
+}
+
+sub
+print_version($$$$)
+{
+    my ($progname, $version, $author) = @_;
+
+    print "\n";
+    print "$progname $version by $author\n";
+    print "\n";
+    exit(0);
+}
+
+# Trim whitespace
+sub
+str_trim(\$)
+{
+    # Use $_[0] because it acts like pass-by-reference.
+    $_[0] =~ s/^\s+//;
+    $_[0] =~ s/\s+$//;
+    return $_[0];
+}
+#################### Mezzanine::Util 1.70 (2008-09-18) ######################
+
+# Print usage information
+sub
+print_usage_info
+{
+    my ($leader, $underbar);
+
+    print "\n";
+    $leader = "$PROGNAME $VERSION Usage Information";
+    $underbar = $leader;
+    $underbar =~ s/./-/g;
+    print "$leader\n$underbar\n";
+    print "\n";
+    print "  Syntax:   $PROGNAME [ options ] <port>:<target(s)> [ ... ]\n";
+    print "\n";
+    print "    -h --help             Show this usage information\n";
+    print "    -d --debug            Turn on debugging\n";
+    print "    -v --version          Show version\n";
+    print "    -f --fork [ <num> ]   Fork <num> procs (default 1; use 0 to run in fg)\n";
+    #print "                                     \n";
+    print "\n";
+    exit(-1);
+}
+
+# Clean up a bit on exit.
+sub
+final_cleanup()
+{
+    if (!scalar(%data)) {
+        return;
+    }
+
+    dprint "Termination requested.  Cleaning up all remaining sockets.\n";
+    if ($DEBUG) {
+        printf STDERR "Data object contents:  %s\n", Dumper(\%data);
+        &show_backtrace();
+    }
+
+    if ($data{"CONTROL"}{"LISTENER"}) {
+        $data{"CONTROL"}{"LISTENER"}->close();
+        unlink("$SOCKETDIR/control.$$");
+    }
+    %data = ();
+    dprint "Cleanup complete.\n";
+}
+
+# Exit after cleanup
+sub
+fatal_signal()
+{
+    &final_cleanup();
+    exit(-1);
+}
+
+# Handle a single var=value config assignment
+sub
+config_set_var($$)
+{
+    my ($conf_var, $conf_value) = @_;
+
+    if (!defined($conf_value)) {
+        return 0;
+    }
+    dprint "Setting \"$conf_var\" = \"$conf_value\"\n";
+    if ($conf_var eq "debug") {
+        $DEBUG = (($conf_value) ? (1) : (0));
+    } elsif ($conf_var eq "logfile") {
+        local *TMP;
+
+        if (substr($conf_value, 0, 1) ne '/') {
+            $conf_value = "/var/log/$conf_value";
+        }
+        if (!open(TMP, ">$conf_value")) {
+            eprint "Unable to open logfile $LOGFILE -- $!\n";
+            return 1;
+        }
+        $LOGFILE = $conf_value;
+        close(STDOUT);
+        open(STDOUT, ">&TMP");
+        close(STDERR);
+        open(STDERR, ">&STDOUT");
+        close(TMP);
+        select(STDOUT);
+    } elsif ($conf_var eq "socketdir") {
+        if (substr($conf_value, 0, 1) ne '/') {
+            $conf_value = "/var/run/$conf_value";
+        }
+        $SOCKETDIR = $conf_value;
+    } elsif ($conf_var eq "fork") {
+        $OPTION{"fork"} = int($conf_value);
+    } elsif ($conf_var eq "targets") {
+        foreach my $sockspec (split(/\s+/, $conf_value)) {
+            &parse_target_spec($sockspec);
+        }
+    } else {
+        wprint "Unrecognized variable \"$conf_var\" in config.\n";
+        return 1;
+    }
+    return 0;
+}
+
+# Load config from disk
+sub
+load_config($)
+{
+    my $config_file = shift;
+    my ($conf_data, $err);
+    local *CONF;
+
+    if (!open(CONF, $config_file)) {
+        wprint "Unable to read config file $config_file -- $!\n";
+        return -1;
+    }
+
+    dprint "Loading config file $config_file.\n";
+    $conf_data = join("", <CONF>);
+    close(CONF);
+
+    # Two styles of line continuation:  backslash-before-newline and next-line-indent
+    $conf_data =~ s/\s*\\\n\s*/ /g;
+    $conf_data =~ s/\s*\n\s+/ /g;
+
+    for ($err = 0; ($conf_data =~ /^\s*(\w+)\s*=\s*(\S*.*)\s*$/g); ) {
+        $err += &config_set_var(lc($1), $2);
+    }
+    return $err;
+}
+
+# Save config file
+sub
+save_config($)
+{
+    my $config_file = shift;
+    my $timestamp = strftime("on %Y-%m-%d at %H:%M:%S", localtime());
+    local *CONF;
+
+    if (!open(CONF, ">$config_file")) {
+        wprint "Unable to write config file $config_file -- $!\n";
+        return -1;
+    }
+
+    print CONF "# Configuration auto-generated by $PROGNAME $VERSION $timestamp.\n\n";
+    print CONF "debug = $DEBUG\n";
+    print CONF "logfile = $LOGFILE\n";
+    print CONF "socketdir = $SOCKETDIR\n";
+    print CONF "fork = $OPTION{fork}\n";
+    printf CONF "targets = %s\n", join(' ', map {
+                                                sprintf("$_:%s", join(',', @{$data{"PROXY"}{$_}{"TARGETS"}}))
+                                            } sort(keys(%{$data{"PROXY"}}))
+                                      );
+    if (close(CONF)) {
+        dprint "Wrote $config_file\n";
+    } else {
+        eprint "Unable to write config file $config_file -- $!\n";
+        return -1;
+    }
+    return 0;
+}
+
+# Add a new listener
+sub
+add_listener($)
+{
+    my $port = shift;
+
+    if (substr($port, 0, 1) eq '/') {
+        $sock = IO::Socket::UNIX->new("Local" => $port, "Type" => SOCK_STREAM, "Listen" => 1, "Timeout" => 0.05);
+        if (! $sock) {
+            eprint "Unable to listen on $port -- $!\n";
+            return 0;
+        }
+    } else {
+        # Open new listening socket on local system, all IP addresses.
+        $sock = IO::Socket::INET->new("LocalAddr" => "0.0.0.0:$port", "Type" => SOCK_STREAM, "Listen" => 128, "Timeout" => 0.05,
+                                      "ReuseAddr" => 1);
+        if (! $sock) {
+            eprint "Unable to listen on 0.0.0.0:$port -- $!\n";
+            return 0;
+        }
+    }
+
+    $data{"LISTENER_PORT"}[$sock->fileno()] = $port;
+    $data{"LISTENER"}{$port} = $sock;
+    push @{$data{"LISTENERS"}}, $sock;
+    $data{"SELECT"}->add($sock);
+    return $sock;
+}
+
+# Add a new target for a listener
+sub
+add_target($port, $target)
+{
+    my ($port, $target) = @_;
+
+    if (exists($data{"PROXY"}{$port}{"TARGET"}{$target})) {
+        wprint "Target $target already exists for port $port.\n";
+        $data{"PROXY"}{$port}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
+        return 0;
+    }
+    $data{"PROXY"}{$port}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
+    push @{$data{"PROXY"}{$port}{"TARGETS"}}, $target;
+    return 1;
+}
+
+# Delete a listener
+sub
+del_listener($)
+{
+    my $port = shift;
+    my $sock;
+
+    if (exists($data{"LISTENER"}{$port})) {
+        $sock = $data{"LISTENER"}{$port};
+    } else {
+        eprint "No listener found on port $port.  Can't remove.\n";
+        return 0;
+    }
+    if (ref($sock) eq "IO::Socket::UNIX") {
+        dprintf("Closing listener:  %s\n", $sock->hostpath());
+        unlink($sock->hostpath());
+    } else {
+        dprintf("Closing listener:  %s:%d\n", $sock->sockhost(), $sock->sockport());
+    }
+    $data{"SELECT"}->remove($sock);
+    delete $data{"LISTENER_PORT"}[$sock->fileno()];
+    delete $data{"LISTENER"}{$port};
+    @{$data{"LISTENERS"}} = grep { $_ != $sock } @{$data{"LISTENERS"}};
+    delete $data{"PROXY"}{$port};
+    $sock->close();
+    return 1;
+}
+
+# Delete a target from a listener
+sub
+del_target($$)
+{
+    my ($port, $target) = @_;
+
+    if (!exists($data{"PROXY"}{$port}{"TARGET"}{$target})) {
+        eprint "Can't delete non-existant target $target for port $port.\n";
+        return 0;
+    }
+    delete $data{"PROXY"}{$port}{"TARGET"}{$target};
+    @{$data{"PROXY"}{$port}{"TARGETS"}} = grep { $_ ne $target } @{$data{"PROXY"}{$port}{"TARGETS"}};
+    return 1;
+}
+
+# Parse a proxy target specifiers
+sub
+parse_target_spec($)
+{
+    my $sockspec = shift;
+    my ($port, $targets, $sock);
+
+    if ($sockspec =~ /^([\/0-9][^:]+):(\S+)$/) {
+        ($port, $targets) = ($1, $2);
+    } else {
+        eprint "Unparseable socket proxy specification \"$sockspec\"\n";
+        return 0;
+    }
+
+    # Check to see if we have an existing socket (for instance, if we're reloading)
+    if (exists($data{"PROXY"}{$port})) {
+        if ($data{"PROXY"}{$port}{"LISTEN"}) {
+            $sock = $data{"PROXY"}{$port}{"LISTEN"};
+        }
+        delete $data{"PROXY"}{$port}{"TARGET"};
+        delete $data{"PROXY"}{$port}{"TARGETS"};
+    }
+    if (! $sock) {
+        if (! ($sock = &add_listener($port))) {
+            return 0;
+        }
+    }
+
+    # Specify targets for this port.
+    foreach my $target (split(',', $targets)) {
+        &add_target($port, $target);
+    }
+    dprintf("Listening socket $sock on %s targetting %s\n",
+            ((ref($sock) eq "IO::Socket::UNIX") ? ($port) : ("0.0.0.0:$port")),
+            join(', ', @{$data{"PROXY"}{$port}{"TARGETS"}}));
+    return 1;
+}
+
+# Choose which of the eligible targets will service the next request.
+sub
+choose_target($)
+{
+    my $port = shift;
+    my ($choices, $choice, $target, $errors);
+
+    $choices = scalar(@{$data{"PROXY"}{$port}{"TARGETS"}});
+
+    # For now, return a randomly-selected entry in the list of possible targets.
+    $choice = int(rand($choices));
+    $target = $data{"PROXY"}{$port}{"TARGETS"}[$choice];
+    dprint "Chose target $target\n";
+    if (($choices > 1) && (($errors = $data{"PROXY"}{$port}{"TARGET"}{$target}{"ERRORS"}) > 0)) {
+        # If this target has errors, the error count is the percent chance a new target
+        # will be chosen.  At 100 errors, the target is essentially dead.
+        dprint "Target $target has $errors errors.  Reconsidering target choice.\n";
+        if ($errors >= 100) {
+            # Delete dead target and choose again.
+            dprint "Too many errors.  Removing target.\n";
+            &del_target($port, $target);
+            return (&choose_target($port));
+        } elsif (int(rand(100)) < $errors) {
+            my $new_choice;
+
+            # We need a new target.  Pick again, and avoid making the same choice.
+            if (($new_choice = int(rand($choices))) == $choice) {
+                $new_choice++;
+                if ($new_choice == $choices) {
+                    $new_choice = 0;
+                }
+            }
+            $target = $data{"PROXY"}{$port}{"TARGETS"}[$new_choice];
+            dprint "New choice:  $target\n";
+        } else {
+            dprint "Sticking with original choice.\n";
+        }
+    }
+    return $target;
+}
+
+sub
+close_connection($)
+{
+    my $proxy_key = shift;
+    my ($client_sock, $proxy_sock);
+
+    # Close down the sockets on both sides.
+    foreach my $sock (@{$data{"CLIENT"}{$proxy_key}}{("CLIENT_SOCK", "PROXY_SOCK")}) {
+        if ($sock) {
+            $sock->shutdown(2);
+            $data{"SELECT"}->remove($sock);
+            delete $data{"PEER"}[$sock->fileno()];
+        }
+    }
+    delete $data{"CLIENT"}{$proxy_key};
+    dprint "Connection $proxy_key closed and purged.\n";
+}
+
+# Parse an incoming command on the control socket and return a reply.
+sub
+process_control_command($)
+{
+    my $cmd = shift;
+    my $ret = "";
+
+    $cmd =~ s/\s+/ /g;
+    &str_trim($cmd);
+    dprint "Got control command \"$cmd\"\n";
+    if ($cmd =~ /^help$/) {
+        $ret .= "$PROGNAME $VERSION Command Summary\n";
+        $ret .= "\n";
+        $ret .= "help                     This screen\n";
+        $ret .= "add <port> <target>      Add new proxy port and/or target\n";
+        $ret .= "del <port> [ <target> ]  Remove proxy port and/or target\n";
+        $ret .= "status                   Display current proxies and stats\n";
+        $ret .= "\n";
+    } elsif ($cmd =~ /^add (\d+) (\S+)$/) {
+        my ($port, $target) = ($1, $2);
+
+        if (!exists($data{"PROXY"}{$port})) {
+            if (! &add_listener($port)) {
+                return "ERR:  Unable to add listener.\n";
+            }
+        }
+        if (&add_target($port, $target)) {
+            $ret .= "Added:  $port -> $target\n";
+        } else {
+            $ret .= "ERR:  Unable to add target.\n";
+        }
+    } elsif ($cmd =~ /^del (\d+)\s*(\S+)?$/) {
+        my ($port, $target) = ($1, $2);
+
+        if ($target) {
+            if (! &del_target($port, $target)) {
+                return "ERR:  Target $target does not exist for $port.\n";
+            } else {
+                $ret .= "Target $target deleted.\n";
+            }
+
+            # Check to see if we removed the last target for this port.
+            if (!scalar(@{$data{"PROXY"}{$port}{"TARGETS"}})) {
+                $target = undef;
+            }
+        }
+        if (! $target) {
+            # If no target was given, or if there are no more targets
+            # for this port, delete the listener altogether.
+            if (&del_listener($port)) {
+                $ret .= "Listener $port deleted.\n";
+            } else {
+                $ret .= "ERR:  Not listening on port $port.\n";
+            }
+        }
+    } elsif ($cmd =~ /^status$/) {
+        foreach my $port (sort(keys(%{$data{"PROXY"}}))) {
+            foreach my $target (sort(keys(%{$data{"PROXY"}{$port}{"TARGET"}}))) {
+                $ret .= sprintf("%d\t%s\t%d\t%d\n", $port, $target, $data{"PROXY"}{$port}{"TARGET"}{$target}{"COUNT"},
+                                $data{"PROXY"}{$port}{"TARGET"}{$target}{"ERRORS"});
+            }
+        }
+        if (! $ret) {
+            $ret = "No proxies currently active.\n";
+        }
+    } else {
+        eprint "Received unrecognized command on control socket:  $cmd\n";
+        $ret = "Unrecognized command \"$cmd\"\n";
+    }
+    return $ret;
+}
+
+sub
+main()
+{
+    # For taint checks
+    delete @ENV{("IFS", "CDPATH", "ENV", "BASH_ENV")};
+    $ENV{"PATH"} = "/bin:/usr/bin:/sbin:/usr/sbin";
+    foreach my $shell ("/bin/bash", "/usr/bin/ksh", "/bin/ksh", "/bin/sh", "/sbin/sh") {
+        if (-f $shell) {
+            $ENV{"SHELL"} = $shell;
+            last;
+        }
+    }
+
+    # Set program name for ps and psutils to see.
+    $0 = $PROGNAME;
+
+    Getopt::Long::Configure("no_getopt_compat", "bundling", "no_ignore_case");
+    Getopt::Long::GetOptions(\%OPTION, "help|h", "version|v", "debug|d!", "fork|f:1");
+
+    if ($OPTION{"version"}) {
+        &print_version($PROGNAME, $VERSION, "Michael Jennings <mej@eterm.org>");
+    } elsif ($OPTION{"help"}) {
+        &print_usage_info();
+    }
+
+    # Set config based on defaults, config file, and options
+    &config_set_var("socketdir", $PROGNAME);
+    &load_config($CONFIG_FILE);
+    &config_set_var("debug", $OPTION{"debug"} || "0");
+    &config_set_var("fork", ((defined($OPTION{"fork"})) ? ($OPTION{"fork"}) : (1)));
+    if ($OPTION{"fork"} > 0) {
+        # Fork and return in the parent.
+        $! = 0;
+        if (!fork()) {
+            if ($!) {
+                eprint "Unable to fork -- $!\n";
+                return -1;
+            }
+        } else {
+            return 0;
+        }
+
+        if (! $LOGFILE) {
+            &config_set_var("logfile", "$PROGNAME.log");
+        }
+    }
+
+    $SIG{"CHLD"} = "IGNORE";
+    $SIG{"HUP"} = sub { &load_config($CONFIG_FILE); };
+    $SIG{"INT"} = $SIG{"TERM"} = \&fatal_signal;
+    $SIG{"PWR"} = sub { &save_config($CONFIG_FILE); };
+
+    # Create IO::Select object early so add_listener() can add to it.
+    $data{"SELECT"} = IO::Select->new();
+
+    # Open listening sockets and record target addresses for later use.
+    foreach my $sockspec (@ARGV) {
+        &parse_target_spec($sockspec);
+    }
+
+    if ($OPTION{"fork"} > 1) {
+        $| = 1;
+        for (my $i = 1; $i < $OPTION{"fork"}; $i++) {
+            my $pid = fork();
+
+            if (!defined($pid)) {
+                eprint "Unable to fork() -- $!.  Continuing.\n";
+                last;
+            } elsif (! $pid) {
+                # Child process.  Continue on.
+                last;
+            } else {
+                dprint "Spawned process $pid (slave $i).\n";
+            }
+        }
+    }
+
+    # Open control socket in each forked process.  Socket must be at least group-writeable.
+    umask(0007);
+    mkdir($SOCKETDIR, 0755);
+    $data{"CONTROL"}{"LISTENER"} = IO::Socket::UNIX->new("Local" => "$SOCKETDIR/control.$$", "Type" => SOCK_STREAM, "Listen" => 1,
+                                                         "Timeout" => 0.05);
+    if (! $data{"CONTROL"}{"LISTENER"}) {
+        eprint "Unable to open control socket $SOCKETDIR/control.$$ -- $!\n";
+        exit(2);
+    }
+    $data{"SELECT"}->add($data{"CONTROL"}{"LISTENER"});
+
+    for (;;) {
+        my (@ready);
+
+        # Connect any new incoming connections.
+        @ready = $data{"SELECT"}->can_read();
+        dprintf("Can read from %d sockets:  %s\n", scalar(@ready), join(' ', @ready));
+        foreach my $sock (@ready) {
+            if ($sock->fileno() == $data{"CONTROL"}{"LISTENER"}->fileno()) {
+                my $control_sock;
+
+                # Incoming control socket connection.
+                $control_sock = $sock->accept();
+                if (! $control_sock) {
+                    eprint "Failed to accept() new control connection on $sock -- $!\n";
+                    next;
+                }
+                push @{$data{"CONTROL"}{"CLIENTS"}}, $control_sock;
+                $data{"SELECT"}->add($control_sock);
+                dprint "Opened new control connection.\n";
+            } elsif (scalar(grep { $_ == $sock } @{$data{"CONTROL"}{"CLIENTS"}})) {
+                my ($buff, $buff_size, $num_read, $ret);
+
+                # Command request from a local control client.
+                $num_read = 0;
+                $buff_size = 65536;
+
+                do {
+                    $ret = $sock->sysread($buff, $buff_size);
+                    if (defined($ret)) {
+                        $num_read += $ret;
+                    } else {
+                        $ret = 0;
+                    }
+                } while ($ret == $buff_size);
+                if ($num_read) {
+                    $ret = &process_control_command($buff);
+                    if ($ret) {
+                        $sock->syswrite($ret);
+                    }
+                } else {
+                    dprint "Read 0 bytes from readable socket $sock.  Closing control connection.\n";
+                    $sock->shutdown(2);
+                    $data{"SELECT"}->remove($sock);
+                    @{$data{"CONTROL"}{"CLIENTS"}} = grep { $_ != $sock } @{$data{"CONTROL"}{"CLIENTS"}};
+                }
+            } elsif (exists($data{"LISTENER_PORT"}[$sock->fileno()])) {
+                my ($port, $target, $client_sock, $client_addr, $client_port);
+                my ($proxy_sock, $proxy_key, $cache_data_proxy_target);
+
+                # Figure out what port this is on and choose our target server.
+                $port = $data{"LISTENER_PORT"}[$sock->fileno()];
+                $target = &choose_target($port);
+                dprint "Incoming connection on port $port being serviced by $target.\n";
+
+                # Save hashref to avoid excess dereferences.
+                $cache_data_proxy_target = $data{"PROXY"}{$port}{"TARGET"}{$target};
+
+                if (substr($target, 0, 1) eq '/') {
+                    # Connect to the target server.
+                    $proxy_sock = IO::Socket::UNIX->new("Peer" => $target, "Type" => SOCK_STREAM, "Timeout" => 0.05);
+                    if (! $proxy_sock) {
+                        eprint "Unable to connect to target $target -- $!\n";
+                        $cache_data_proxy_target->{"ERRORS"}++;
+                        next;
+                    }
+                } else {
+                    # Split off the port if there is one
+                    if ($target =~ /^(.*):([^:]+)$/) {
+                        ($target, $port) = ($1, $2);
+                    }
+
+                    # Connect to the target server.
+                    $proxy_sock = IO::Socket::INET->new("PeerAddr" => "$target:$port", "Type" => SOCK_STREAM, "Timeout" => 0.05);
+                    if (! $proxy_sock) {
+                        eprint "Unable to connect to target $target:$port -- $!\n";
+                        $cache_data_proxy_target->{"ERRORS"}++;
+                        next;
+                    }
+                }
+                if (exists($cache_data_proxy_target->{"ERRORS"}) && $cache_data_proxy_target->{"ERRORS"}) {
+                    $cache_data_proxy_target->{"ERRORS"}--;
+                }
+
+                # Accept the connection and determine to whom we're connected.
+                $client_sock = $sock->accept();
+                if (! $client_sock) {
+                    eprint "Failed to accept() new connection on $sock -- $!\n";
+                    $proxy_sock->close();
+                    next;
+                }
+                $client_port = $client_sock->peerport();
+                $client_addr = $client_sock->peerhost();
+
+                # Save the information about our new client connection.
+                $proxy_key = "$client_addr:$client_port <-> $target:$port";
+                $data{"CLIENT"}{$proxy_key} = { "CLIENT_SOCK" => $client_sock, "PROXY_SOCK" => $proxy_sock };
+                $data{"SELECT"}->add($client_sock, $proxy_sock);
+                $data{"PEER"}[$client_sock->fileno()] = { "SOCK" => $proxy_sock, "PROXY" => $proxy_key };
+                $data{"PEER"}[$proxy_sock->fileno()] = { "SOCK" => $client_sock, "PROXY" => $proxy_key };
+                $cache_data_proxy_target->{"COUNT"}++;
+                dprint "Created proxy connection:  $proxy_key\n";
+            } else {
+                my ($peer_sock, $proxy_key, $buff, $buff_size, $num_read, $ret);
+
+                $num_read = 0;
+                $buff_size = 65536;
+                if (!exists($data{"PEER"}[$sock->fileno()])) {
+                    dprint "Unable to locate client socket $sock.  Possibly an old client connection already closed?\n";
+                    $data{"SELECT"}->remove($sock);
+                    next;
+                }
+                ($peer_sock, $proxy_key) = @{$data{"PEER"}[$sock->fileno()]}{("SOCK", "PROXY")};
+                dprintf("Readable data on connection \"%s\" from %s (%s) to %s (%s).\n", $proxy_key, $sock,
+                        (($sock == $data{"CLIENT"}{$proxy_key}{"CLIENT_SOCK"}) ? ("client") : ("proxy")), $peer_sock,
+                        (($peer_sock == $data{"CLIENT"}{$proxy_key}{"CLIENT_SOCK"}) ? ("client") : ("proxy")));
+                do {
+                    $ret = $sock->sysread($buff, $buff_size);
+                    if (defined($ret)) {
+                        $num_read += $ret;
+                    } else {
+                        eprint "Unable to read from $sock ($proxy_key) -- $!\n";
+                        &close_connection($proxy_key);
+                        $ret = 0;
+                    }
+                } while ($ret == $buff_size);
+                if ($num_read) {
+                    $ret = $peer_sock->syswrite($buff);
+                    if (!defined($ret)) {
+                        eprint "Unable to write to $peer_sock ($proxy_key) -- $!\n";
+                        &close_connection($proxy_key);
+                    } elsif ($ret < $num_read) {
+                        # FIXME -- Buffer send for later somehow?
+                        eprint "Wrote only $ret of $num_read bytes to $peer_sock ($proxy_key).  Closing connection.\n";
+                        &close_connection($proxy_key);
+                    } else {
+                        dprint "Proxied $ret bytes.\n";
+                    }
+                } else {
+                    # We were told we could read, but we got nothing back.  Close up shop.
+                    dprint "Read 0 bytes from readable socket $sock.  Closing connection $proxy_key\n";
+                    &close_connection($proxy_key);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+exit &main();
+
+END {
+    &final_cleanup();
+}
