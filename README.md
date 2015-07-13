@@ -19,11 +19,11 @@ once this first round of improvements are in place.
 
 Syntax:
 
-`# equilibria **listener_port**:**target_address**:**target_port**,**target_address**:**target_port**,...`
+`# equilibria listener_port:target_address:target_port,target_address:target_port,...`
 
-This will open a TCP socket listening on `**listener_port**`, and each
+This will open a TCP socket listening on `listener_port`, and each
 incoming connection will choose one of the subsequent
-`**target_address**:**target_port**` combinations to forward to.
+`target_address:target_port` combinations to forward to.
 
 
 [![Join the chat at https://gitter.im/mej/equilibria](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/mej/equilibria?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
