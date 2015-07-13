@@ -33,7 +33,7 @@ use IO::Select;
 use Socket;
 use POSIX;
 
-my ($PROGNAME, $VERSION) = ("equilibria", "1.0");
+my ($PROGNAME, $VERSION) = ("equilibria", "1.1");
 my $CONFIG_FILE = "/etc/$PROGNAME/$PROGNAME.conf";
 my ($DEBUG, $LOGFILE, $SOCKETDIR) = (0, "", "");
 my %OPTION;

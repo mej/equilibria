@@ -1,12 +1,17 @@
+%{!?_rel:%{expand:%%global _rel 0.%(date '+%Y%m%d').%(git show -s --pretty=format:%h)}}
+
 Summary: Simple Socket Proxy and Load Balancer
 Name: equilibria
-Version: 1.0
-Release: 1.mej%{?dist}
+Version: 1.1
+Release: %{_rel}%{?dist}
+#Release: 1%{?dist}
 License: BSD
 Group: Applications/Internet
 Source0: %{name}
 Source1: %{name}.init
 Source2: %{name}.conf
+Source3: LICENSE
+Source4: README.md
 BuildArch: noarch
 Prefix: %{_prefix}
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
@@ -16,6 +21,9 @@ Equilibria is a simple load-balancing socket proxy which can provide
 basic packet forwarding, failover, and other useful Layer 3 features
 between hosts, across firewalls, or among nodes in a cluster or grid.
 
+
+%prep
+cp %{SOURCE3} %{SOURCE4} .
 
 %install
 %{__rm} -rf $RPM_BUILD_ROOT
@@ -46,7 +54,7 @@ fi
 
 %files
 %defattr(-, root, root, 0755)
-%doc LICENSE README*
+%doc LICENSE README.md
 %dir %{_sysconfdir}/%{name}
 %config(noreplace) %{_sysconfdir}/%{name}/%{name}.conf
 %{_sbindir}/%{name}
