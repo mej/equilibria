@@ -30,14 +30,35 @@ use Data::Dumper;
 use Getopt::Long;
 use IO::Socket;
 use IO::Select;
-use Socket;
 use POSIX;
+use Socket;
+use Storable ();
 
 my ($PROGNAME, $VERSION) = ("equilibria", "1.1");
 my $CONFIG_FILE = "/etc/$PROGNAME/$PROGNAME.conf";
 my ($DEBUG, $LOGFILE, $SOCKETDIR) = (0, "", "");
+my $INET_SOCK_CLASS = "";
 my %OPTION;
 my %data;
+
+eval {
+    require IO::Socket::IP;
+    IO::Socket::IP->import("-register");
+    $INET_SOCK_CLASS = "IO::Socket::IP";
+};
+if ($@) {
+    print "Unable to load IO::Socket::IP -- $@.  Falling back on IO::Socket::INET6.\n";
+    eval {
+        require IO::Socket::INET6;
+        IO::Socket::INET6->import();
+        $INET_SOCK_CLASS = "IO::Socket::INET6";
+    };
+    if ($@) {
+        print "ERROR:  Unable to find any IPv6-aware socket class.  Recommend installing IO::Socket::IP.\n";
+        $INET_SOCK_CLASS = "IO::Socket::INET";
+    }
+}
+
 
 #################### Mezzanine::Util 1.70 (2008-09-18) ######################
 # Debugging output
@@ -203,7 +224,7 @@ print_usage_info
     $underbar =~ s/./-/g;
     print "$leader\n$underbar\n";
     print "\n";
-    print "  Syntax:   $PROGNAME [ options ] <port>:<target(s)> [ ... ]\n";
+    print "  Syntax:   $PROGNAME [ options ] [<addr>:]<port>:<target(s)> [ ... ]\n";
     print "\n";
     print "    -h --help             Show this usage information\n";
     print "    -d --debug            Turn on debugging\n";
@@ -353,26 +374,26 @@ save_config($)
 sub
 add_listener($)
 {
-    my $port = shift;
+    my $locaddr = shift;
 
-    if (substr($port, 0, 1) eq '/') {
-        $sock = IO::Socket::UNIX->new("Local" => $port, "Type" => SOCK_STREAM, "Listen" => 1, "Timeout" => 0.05);
+    if (substr($locaddr, 0, 1) eq '/') {
+        $sock = IO::Socket::UNIX->new("Local" => $locaddr, "Type" => SOCK_STREAM, "Listen" => 1, "Timeout" => 0.05);
         if (! $sock) {
-            eprint "Unable to listen on $port -- $!\n";
+            eprint "Unable to listen on $locaddr -- $!\n";
             return 0;
         }
     } else {
         # Open new listening socket on local system, all IP addresses.
-        $sock = IO::Socket::INET->new("LocalAddr" => "0.0.0.0:$port", "Type" => SOCK_STREAM, "Listen" => 128, "Timeout" => 0.05,
-                                      "ReuseAddr" => 1);
+        $sock = ${INET_SOCK_CLASS}->new("LocalAddr" => $locaddr, "Type" => SOCK_STREAM, "Listen" => 128, "Timeout" => 0.05,
+                                        "ReuseAddr" => 1);
         if (! $sock) {
-            eprint "Unable to listen on 0.0.0.0:$port -- $!\n";
+            eprint "Unable to listen on $locaddr -- $!\n";
             return 0;
         }
     }
 
-    $data{"LISTENER_PORT"}[$sock->fileno()] = $port;
-    $data{"LISTENER"}{$port} = $sock;
+    $data{"LISTENER_LOCADDR"}[$sock->fileno()] = $locaddr;
+    $data{"LISTENER"}{$locaddr} = $sock;
     push @{$data{"LISTENERS"}}, $sock;
     $data{"SELECT"}->add($sock);
     return $sock;
@@ -380,17 +401,17 @@ add_listener($)
 
 # Add a new target for a listener
 sub
-add_target($port, $target)
+add_target($locaddr, $target)
 {
-    my ($port, $target) = @_;
+    my ($locaddr, $target) = @_;
 
-    if (exists($data{"PROXY"}{$port}{"TARGET"}{$target})) {
-        wprint "Target $target already exists for port $port.\n";
-        $data{"PROXY"}{$port}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
+    if (exists($data{"PROXY"}{$locaddr}{"TARGET"}{$target})) {
+        wprint "Target $target already exists for locaddr $locaddr.\n";
+        $data{"PROXY"}{$locaddr}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
         return 0;
     }
-    $data{"PROXY"}{$port}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
-    push @{$data{"PROXY"}{$port}{"TARGETS"}}, $target;
+    $data{"PROXY"}{$locaddr}{"TARGET"}{$target} = { "COUNT" => 0, "ERRORS" => 0 };
+    push @{$data{"PROXY"}{$locaddr}{"TARGETS"}}, $target;
     return 1;
 }
 
@@ -398,13 +419,13 @@ add_target($port, $target)
 sub
 del_listener($)
 {
-    my $port = shift;
+    my $locaddr = shift;
     my $sock;
 
-    if (exists($data{"LISTENER"}{$port})) {
-        $sock = $data{"LISTENER"}{$port};
+    if (exists($data{"LISTENER"}{$locaddr})) {
+        $sock = $data{"LISTENER"}{$locaddr};
     } else {
-        eprint "No listener found on port $port.  Can't remove.\n";
+        eprint "No listener found on locaddr $locaddr.  Can't remove.\n";
         return 0;
     }
     if (ref($sock) eq "IO::Socket::UNIX") {
@@ -414,10 +435,10 @@ del_listener($)
         dprintf("Closing listener:  %s:%d\n", $sock->sockhost(), $sock->sockport());
     }
     $data{"SELECT"}->remove($sock);
-    delete $data{"LISTENER_PORT"}[$sock->fileno()];
-    delete $data{"LISTENER"}{$port};
+    delete $data{"LISTENER_LOCADDR"}[$sock->fileno()];
+    delete $data{"LISTENER"}{$locaddr};
     @{$data{"LISTENERS"}} = grep { $_ != $sock } @{$data{"LISTENERS"}};
-    delete $data{"PROXY"}{$port};
+    delete $data{"PROXY"}{$locaddr};
     $sock->close();
     return 1;
 }
@@ -426,14 +447,14 @@ del_listener($)
 sub
 del_target($$)
 {
-    my ($port, $target) = @_;
+    my ($locaddr, $target) = @_;
 
-    if (!exists($data{"PROXY"}{$port}{"TARGET"}{$target})) {
-        eprint "Can't delete non-existant target $target for port $port.\n";
+    if (!exists($data{"PROXY"}{$locaddr}{"TARGET"}{$target})) {
+        eprint "Can't delete non-existant target $target for port $locaddr.\n";
         return 0;
     }
-    delete $data{"PROXY"}{$port}{"TARGET"}{$target};
-    @{$data{"PROXY"}{$port}{"TARGETS"}} = grep { $_ ne $target } @{$data{"PROXY"}{$port}{"TARGETS"}};
+    delete $data{"PROXY"}{$locaddr}{"TARGET"}{$target};
+    @{$data{"PROXY"}{$locaddr}{"TARGETS"}} = grep { $_ ne $target } @{$data{"PROXY"}{$locaddr}{"TARGETS"}};
     return 1;
 }
 
@@ -442,36 +463,39 @@ sub
 parse_target_spec($)
 {
     my $sockspec = shift;
-    my ($port, $targets, $sock);
+    my ($locaddr, $targets, $sock);
 
-    if ($sockspec =~ /^([\/0-9][^:]+):(\S+)$/) {
-        ($port, $targets) = ($1, $2);
+    if ($sockspec =~ /^(\.{0,2}\/[^\@>]+|(?:(?:\[[A-Fa-f0-9\/:\.]+(?:%\w+)?\]|[x[:xdigit:]\.]+):)?\d+)[\@>]+(\S+)$/) {
+        ($locaddr, $targets) = ($1, $2);
+
+        if ($locaddr =~ /^\d+$/) {
+            $locaddr = "0.0.0.0:$locaddr";
+        }
     } else {
         eprint "Unparseable socket proxy specification \"$sockspec\"\n";
         return 0;
     }
 
     # Check to see if we have an existing socket (for instance, if we're reloading)
-    if (exists($data{"PROXY"}{$port})) {
-        if ($data{"PROXY"}{$port}{"LISTEN"}) {
-            $sock = $data{"PROXY"}{$port}{"LISTEN"};
+    if (exists($data{"PROXY"}{$locaddr})) {
+        if ($data{"PROXY"}{$locaddr}{"LISTEN"}) {
+            $sock = $data{"PROXY"}{$locaddr}{"LISTEN"};
         }
-        delete $data{"PROXY"}{$port}{"TARGET"};
-        delete $data{"PROXY"}{$port}{"TARGETS"};
+        delete $data{"PROXY"}{$locaddr}{"TARGET"};
+        delete $data{"PROXY"}{$locaddr}{"TARGETS"};
     }
     if (! $sock) {
-        if (! ($sock = &add_listener($port))) {
+        if (! ($sock = &add_listener($locaddr))) {
             return 0;
         }
     }
 
     # Specify targets for this port.
     foreach my $target (split(',', $targets)) {
-        &add_target($port, $target);
+        &add_target($locaddr, $target);
     }
-    dprintf("Listening socket $sock on %s targetting %s\n",
-            ((ref($sock) eq "IO::Socket::UNIX") ? ($port) : ("0.0.0.0:$port")),
-            join(', ', @{$data{"PROXY"}{$port}{"TARGETS"}}));
+    dprintf("Listening socket %s on %s targetting %s\n", $sock, $locaddr,
+            join(', ', @{$data{"PROXY"}{$locaddr}{"TARGETS"}}));
     return 1;
 }
 
@@ -479,24 +503,24 @@ parse_target_spec($)
 sub
 choose_target($)
 {
-    my $port = shift;
+    my $locaddr = shift;
     my ($choices, $choice, $target, $errors);
 
-    $choices = scalar(@{$data{"PROXY"}{$port}{"TARGETS"}});
+    $choices = scalar(@{$data{"PROXY"}{$locaddr}{"TARGETS"}});
 
     # For now, return a randomly-selected entry in the list of possible targets.
     $choice = int(rand($choices));
-    $target = $data{"PROXY"}{$port}{"TARGETS"}[$choice];
+    $target = $data{"PROXY"}{$locaddr}{"TARGETS"}[$choice];
     dprint "Chose target $target\n";
-    if (($choices > 1) && (($errors = $data{"PROXY"}{$port}{"TARGET"}{$target}{"ERRORS"}) > 0)) {
+    if (($choices > 1) && (($errors = $data{"PROXY"}{$locaddr}{"TARGET"}{$target}{"ERRORS"}) > 0)) {
         # If this target has errors, the error count is the percent chance a new target
         # will be chosen.  At 100 errors, the target is essentially dead.
         dprint "Target $target has $errors errors.  Reconsidering target choice.\n";
         if ($errors >= 100) {
             # Delete dead target and choose again.
             dprint "Too many errors.  Removing target.\n";
-            &del_target($port, $target);
-            return (&choose_target($port));
+            &del_target($locaddr, $target);
+            return (&choose_target($locaddr));
         } elsif (int(rand(100)) < $errors) {
             my $new_choice;
 
@@ -507,7 +531,7 @@ choose_target($)
                     $new_choice = 0;
                 }
             }
-            $target = $data{"PROXY"}{$port}{"TARGETS"}[$new_choice];
+            $target = $data{"PROXY"}{$locaddr}{"TARGETS"}[$new_choice];
             dprint "New choice:  $target\n";
         } else {
             dprint "Sticking with original choice.\n";
@@ -548,52 +572,52 @@ process_control_command($)
         $ret .= "$PROGNAME $VERSION Command Summary\n";
         $ret .= "\n";
         $ret .= "help                     This screen\n";
-        $ret .= "add <port> <target>      Add new proxy port and/or target\n";
-        $ret .= "del <port> [ <target> ]  Remove proxy port and/or target\n";
+        $ret .= "add <locaddr> <target>      Add new proxy locaddr and/or target\n";
+        $ret .= "del <locaddr> [ <target> ]  Remove proxy locaddr and/or target\n";
         $ret .= "status                   Display current proxies and stats\n";
         $ret .= "\n";
     } elsif ($cmd =~ /^add (\d+) (\S+)$/) {
-        my ($port, $target) = ($1, $2);
+        my ($locaddr, $target) = ($1, $2);
 
-        if (!exists($data{"PROXY"}{$port})) {
-            if (! &add_listener($port)) {
+        if (!exists($data{"PROXY"}{$locaddr})) {
+            if (! &add_listener($locaddr)) {
                 return "ERR:  Unable to add listener.\n";
             }
         }
-        if (&add_target($port, $target)) {
-            $ret .= "Added:  $port -> $target\n";
+        if (&add_target($locaddr, $target)) {
+            $ret .= "Added:  $locaddr -> $target\n";
         } else {
             $ret .= "ERR:  Unable to add target.\n";
         }
     } elsif ($cmd =~ /^del (\d+)\s*(\S+)?$/) {
-        my ($port, $target) = ($1, $2);
+        my ($locaddr, $target) = ($1, $2);
 
         if ($target) {
-            if (! &del_target($port, $target)) {
-                return "ERR:  Target $target does not exist for $port.\n";
+            if (! &del_target($locaddr, $target)) {
+                return "ERR:  Target $target does not exist for $locaddr.\n";
             } else {
                 $ret .= "Target $target deleted.\n";
             }
 
             # Check to see if we removed the last target for this port.
-            if (!scalar(@{$data{"PROXY"}{$port}{"TARGETS"}})) {
+            if (!scalar(@{$data{"PROXY"}{$locaddr}{"TARGETS"}})) {
                 $target = undef;
             }
         }
         if (! $target) {
             # If no target was given, or if there are no more targets
             # for this port, delete the listener altogether.
-            if (&del_listener($port)) {
-                $ret .= "Listener $port deleted.\n";
+            if (&del_listener($locaddr)) {
+                $ret .= "Listener $locaddr deleted.\n";
             } else {
-                $ret .= "ERR:  Not listening on port $port.\n";
+                $ret .= "ERR:  Not listening on port $locaddr.\n";
             }
         }
     } elsif ($cmd =~ /^status$/) {
-        foreach my $port (sort(keys(%{$data{"PROXY"}}))) {
-            foreach my $target (sort(keys(%{$data{"PROXY"}{$port}{"TARGET"}}))) {
-                $ret .= sprintf("%d\t%s\t%d\t%d\n", $port, $target, $data{"PROXY"}{$port}{"TARGET"}{$target}{"COUNT"},
-                                $data{"PROXY"}{$port}{"TARGET"}{$target}{"ERRORS"});
+        foreach my $locaddr (sort(keys(%{$data{"PROXY"}}))) {
+            foreach my $target (sort(keys(%{$data{"PROXY"}{$locaddr}{"TARGET"}}))) {
+                $ret .= sprintf("%d\t%s\t%d\t%d\n", $locaddr, $target, $data{"PROXY"}{$locaddr}{"TARGET"}{$target}{"COUNT"},
+                                $data{"PROXY"}{$locaddr}{"TARGET"}{$target}{"ERRORS"});
             }
         }
         if (! $ret) {
@@ -739,19 +763,19 @@ main()
                     $data{"SELECT"}->remove($sock);
                     @{$data{"CONTROL"}{"CLIENTS"}} = grep { $_ != $sock } @{$data{"CONTROL"}{"CLIENTS"}};
                 }
-            } elsif (exists($data{"LISTENER_PORT"}[$sock->fileno()])) {
-                my ($port, $target, $client_sock, $client_addr, $client_port);
+            } elsif (exists($data{"LISTENER_LOCADDR"}[$sock->fileno()])) {
+                my ($locaddr, $target, $client_sock, $client_addr);
                 my ($proxy_sock, $proxy_key, $cache_data_proxy_target);
 
-                # Figure out what port this is on and choose our target server.
-                $port = $data{"LISTENER_PORT"}[$sock->fileno()];
-                $target = &choose_target($port);
-                dprint "Incoming connection on port $port being serviced by $target.\n";
+                # Figure out what listener this is on and choose our target server.
+                $locaddr = $data{"LISTENER_LOCADDR"}[$sock->fileno()];
+                $target = &choose_target($locaddr);
+                dprint "Incoming connection on local address $locaddr being serviced by $target.\n";
 
                 # Save hashref to avoid excess dereferences.
-                $cache_data_proxy_target = $data{"PROXY"}{$port}{"TARGET"}{$target};
+                $cache_data_proxy_target = $data{"PROXY"}{$locaddr}{"TARGET"}{$target};
 
-                if (substr($target, 0, 1) eq '/') {
+                if ($target =~ /^\.{0,2}\// && -S $target) {
                     # Connect to the target server.
                     $proxy_sock = IO::Socket::UNIX->new("Peer" => $target, "Type" => SOCK_STREAM, "Timeout" => 0.05);
                     if (! $proxy_sock) {
@@ -760,15 +784,10 @@ main()
                         next;
                     }
                 } else {
-                    # Split off the port if there is one
-                    if ($target =~ /^(.*):([^:]+)$/) {
-                        ($target, $port) = ($1, $2);
-                    }
-
                     # Connect to the target server.
-                    $proxy_sock = IO::Socket::INET->new("PeerAddr" => "$target:$port", "Type" => SOCK_STREAM, "Timeout" => 0.05);
+                    $proxy_sock = ${INET_SOCK_CLASS}->new("PeerAddr" => $target, "Type" => SOCK_STREAM, "Timeout" => 0.05);
                     if (! $proxy_sock) {
-                        eprint "Unable to connect to target $target:$port -- $!\n";
+                        eprint "Unable to connect to target $target -- $!\n";
                         $cache_data_proxy_target->{"ERRORS"}++;
                         next;
                     }
@@ -784,11 +803,17 @@ main()
                     $proxy_sock->close();
                     next;
                 }
-                $client_port = $client_sock->peerport();
-                $client_addr = $client_sock->peerhost();
+                dprint "Created socket $proxy_sock to proxy traffic from $client_sock at $locaddr to $target.\n";
 
+                if ($client_sock->can("peerpath")) {
+                    dprint "Client is a UNIX socket.\n";
+                    $client_addr = $client_sock->peerpath();
+                } else {
+                    dprint "Client is an IP socket.\n";
+                    $client_addr = $client_sock->peeraddr();
+                }
                 # Save the information about our new client connection.
-                $proxy_key = "$client_addr:$client_port <-> $target:$port";
+                $proxy_key = "$client_addr <-> $target";
                 $data{"CLIENT"}{$proxy_key} = { "CLIENT_SOCK" => $client_sock, "PROXY_SOCK" => $proxy_sock };
                 $data{"SELECT"}->add($client_sock, $proxy_sock);
                 $data{"PEER"}[$client_sock->fileno()] = { "SOCK" => $proxy_sock, "PROXY" => $proxy_key };
