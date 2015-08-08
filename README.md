@@ -19,11 +19,20 @@ once this first round of improvements are in place.
 
 Syntax:
 
-`# equilibria listener_port:target_address:target_port,target_address:target_port,...`
+`# equilibria [listener_address:]listener_port>>>target_address:target_port,target_address:target_port,...`
 
-This will open a TCP socket listening on `listener_port`, and each
-incoming connection will choose one of the subsequent
-`target_address:target_port` combinations to forward to.
+This will open a TCP socket listening on `listener_address` at
+`listener_port`, and each incoming connection will choose one of the
+subsequent `target_address:target_port` combinations to forward to.
+The default address to bind the listening socket is `0.0.0.0` for IPv4
+or `[::0]` for IPv6.  Numeric IPv6 addresses must be enclosed in
+square brackets (e.g., `[2060:3ac1:60::88b2]:443`).
+
+The listening socket is entirely separate from the target socket, so
+specifying different families for each is fully supported.  For
+example, an IPv6 listening socket can proxy to an IPv4, IPv6, or even
+UNIX socket, and vice versa.
+
 
 
 ## TODO
