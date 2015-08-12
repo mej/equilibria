@@ -224,7 +224,7 @@ print_usage_info
     $underbar =~ s/./-/g;
     print "$leader\n$underbar\n";
     print "\n";
-    print "  Syntax:   $PROGNAME [ options ] [<addr>:]<port>:<target(s)> [ ... ]\n";
+    print "  Syntax:   $PROGNAME [ options ] [<addr>:]<port>>>><target(s)> [ ... ]\n";
     print "\n";
     print "    -h --help             Show this usage information\n";
     print "    -d --debug            Turn on debugging\n";
@@ -358,7 +358,7 @@ save_config($)
     print CONF "socketdir = $SOCKETDIR\n";
     print CONF "fork = $OPTION{fork}\n";
     printf CONF "targets = %s\n", join(' ', map {
-                                                sprintf("$_:%s", join(',', @{$data{"PROXY"}{$_}{"TARGETS"}}))
+                                                sprintf("$_>>%s", join(',', @{$data{"PROXY"}{$_}{"TARGETS"}}))
                                             } sort(keys(%{$data{"PROXY"}}))
                                       );
     if (close(CONF)) {
@@ -425,7 +425,7 @@ del_listener($)
     if (exists($data{"LISTENER"}{$locaddr})) {
         $sock = $data{"LISTENER"}{$locaddr};
     } else {
-        eprint "No listener found on locaddr $locaddr.  Can't remove.\n";
+        eprint "No listener found on locaddr $locaddr.  Unable to remove.\n";
         return 0;
     }
     if (ref($sock) eq "IO::Socket::UNIX") {
@@ -450,7 +450,7 @@ del_target($$)
     my ($locaddr, $target) = @_;
 
     if (!exists($data{"PROXY"}{$locaddr}{"TARGET"}{$target})) {
-        eprint "Can't delete non-existant target $target for port $locaddr.\n";
+        eprint "Unable to delete non-existent target $target for port $locaddr.\n";
         return 0;
     }
     delete $data{"PROXY"}{$locaddr}{"TARGET"}{$target};
@@ -476,7 +476,7 @@ parse_target_spec($)
         return 0;
     }
 
-    # Check to see if we have an existing socket (for instance, if we're reloading)
+    # Check to see if we have an existing socket (for instance, if we are reloading)
     if (exists($data{"PROXY"}{$locaddr})) {
         if ($data{"PROXY"}{$locaddr}{"LISTEN"}) {
             $sock = $data{"PROXY"}{$locaddr}{"LISTEN"};
@@ -796,7 +796,7 @@ main()
                     $cache_data_proxy_target->{"ERRORS"}--;
                 }
 
-                # Accept the connection and determine to whom we're connected.
+                # Accept the connection and determine to whom we are connected.
                 $client_sock = $sock->accept();
                 if (! $client_sock) {
                     eprint "Failed to accept() new connection on $sock -- $!\n";
