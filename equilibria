@@ -37,6 +37,9 @@ use Storable ();
 my ($PROGNAME, $VERSION) = ("equilibria", "1.1");
 my $CONFIG_FILE = "/etc/$PROGNAME/$PROGNAME.conf";
 my ($DEBUG, $LOGFILE, $SOCKETDIR) = (0, "", "");
+my $LISTENER_REGEX = '\.{0,2}\/[^\@<=>]+|(?:(?:\[[A-Fa-f0-9\/:\.]+(?:%\w+)?\]|[x[:xdigit:]\.]+):)?\d+';
+my $DELIM_REGEX = '[\@<=>]+';
+my $TARGET_REGEX = '\S+';
 my $INET_SOCK_CLASS = "";
 my %OPTION;
 my %data;
@@ -562,8 +565,8 @@ parse_target_spec($)
     my $sockspec = shift;
     my ($locaddr, $targets, $sock);
 
-    if ($sockspec =~ /^(\.{0,2}\/[^\@>]+|(?:(?:\[[A-Fa-f0-9\/:\.]+(?:%\w+)?\]|[x[:xdigit:]\.]+):)?\d+)[\@>]+(\S+)$/) {
-        ($locaddr, $targets) = ($1, $2);
+    if ($sockspec =~ /^${LISTENER_REGEX}${DELIM_REGEX}${TARGET_REGEX}$/) {
+        ($locaddr, $targets) = ($1, $3);
 
         if ($locaddr =~ /^\d+$/) {
             $locaddr = "0.0.0.0:$locaddr";
@@ -655,6 +658,26 @@ close_connection($)
     dprint "Connection $proxy_key closed and purged.\n";
 }
 
+sub
+close_connections_by_target($)
+{
+    my ($target) = @_;
+
+    dprint "Closing all connections to target \"$target\"";
+    foreach my $proxy_key (grep { $_ =~ / <-> $target$/ } keys(%{$data{"CLIENT"}})) {
+        &close_connection($proxy_key);
+    }
+}
+
+sub
+close_connections_by_listener($)
+{
+    my ($listener) = @_;
+
+    dprint "Closing all connections associated with listener \"$listener\"";
+
+}
+
 # Parse an incoming command on the control socket and return a reply.
 sub
 process_control_command($)
@@ -665,49 +688,60 @@ process_control_command($)
     $cmd =~ s/\s+/ /g;
     &str_trim($cmd);
     dprint "Got control command \"$cmd\"\n";
-    if ($cmd =~ /^help$/) {
+    if ($cmd =~ /^help$/i) {
         $ret .= "$PROGNAME $VERSION Command Summary\n";
         $ret .= "\n";
-        $ret .= "help                     This screen\n";
-        $ret .= "add <locaddr> <target>      Add new proxy locaddr and/or target\n";
-        $ret .= "del <locaddr> [ <target> ]  Remove proxy locaddr and/or target\n";
-        $ret .= "status                   Display current proxies and stats\n";
+        $ret .= "help                        This screen\n";
+        $ret .= "add <locaddr> <target>      Add new proxy listener with specified target(s)\n";
+        $ret .= "drain <locaddr> [<target>]  Remove specified proxy (or just specific target(s))\n";
+        $ret .= "del <locaddr> [<target>]    Like \"drain\" but kills existing connections\n";
+        $ret .= "status                      Display current proxies and stats\n";
         $ret .= "\n";
-    } elsif ($cmd =~ /^add (\d+) (\S+)$/) {
-        my ($locaddr, $target) = ($1, $2);
+        $ret .= "Developer commands:  dump, examine, serialize\n";
+        #$ret .= "                            \n";
+        $ret .= "\n";
+    } elsif (($cmd =~ /^add (${LISTENER_REGEX})( )(${TARGET_REGEX})$/i)
+             || ($cmd =~ /^add (${LISTENER_REGEX})(${DELIM_REGEX})(${TARGET_REGEX})$/i)) {
+        my ($locaddr, $target) = ($1, $3);
 
         if (!exists($data{"PROXY"}{$locaddr})) {
             if (! &add_listener($locaddr)) {
-                return "ERR:  Unable to add listener.\n";
+                return "ERROR:  Unable to add listener.\n";
             }
         }
         if (&add_target($locaddr, $target)) {
             $ret .= "Added:  $locaddr -> $target\n";
         } else {
-            $ret .= "ERR:  Unable to add target.\n";
+            $ret .= "ERROR:  Unable to add target \"$target\" to listener \"$locaddr\"\n";
         }
-    } elsif ($cmd =~ /^del (\d+)\s*(\S+)?$/) {
-        my ($locaddr, $target) = ($1, $2);
+    } elsif (($cmd =~ /^(del(?:ete)?|remove|rm|drain) (${LISTENER_REGEX})( (${TARGET_REGEX}))?$/i)
+             || ($cmd =~ /^(del(?:ete)?|remove|rm|drain) (${LISTENER_REGEX})(${DELIM_REGEX}(${TARGET_REGEX}))?$/i)) {
+        my ($subcmd, $locaddr, $targetlist) = (lc($1), $2, $4);
 
-        if ($target) {
-            if (! &del_target($locaddr, $target)) {
-                return "ERR:  Target $target does not exist for $locaddr.\n";
-            } else {
-                $ret .= "Target $target deleted.\n";
+        if ($targetlist) {
+            foreach my $target (split(',', $targetlist)) {
+                if (! &del_target($locaddr, $target)) {
+                    $ret .= "ERROR:  Target \"$target\" does not exist for listener \"$locaddr\"\n";
+                } else {
+                    $ret .= "Target \"$target\" deleted from listener \"$locaddr\"\n";
+                }
+                if ($subcmd ne "drain") {
+                    # Kill all current connections to this target, if any.
+                    
+                }
             }
-
-            # Check to see if we removed the last target for this port.
+            # Check to see if we removed the last target for this listener.
             if (!scalar(@{$data{"PROXY"}{$locaddr}{"TARGETS"}})) {
-                $target = undef;
+                $targetlist = undef;
             }
         }
-        if (! $target) {
+        if (! $targetlist) {
             # If no target was given, or if there are no more targets
             # for this port, delete the listener altogether.
             if (&del_listener($locaddr)) {
                 $ret .= "Listener $locaddr deleted.\n";
             } else {
-                $ret .= "ERR:  Not listening on port $locaddr.\n";
+                $ret .= "ERROR:  Not listening on $locaddr.\n";
             }
         }
     } elsif ($cmd =~ /^status$/) {
@@ -720,6 +754,12 @@ process_control_command($)
         if (! $ret) {
             $ret = "No proxies currently active.\n";
         }
+    } elsif ($cmd =~ /^dump$/i) {
+        $ret = Dumper(\%data);
+    } elsif ($cmd =~ /^examine$/i) {
+        $ret = &examine_object(\%data);
+    } elsif ($cmd =~ /^serialize$/i) {
+        $ret = Storable::freeze(\%data);
     } else {
         eprint "Received unrecognized command on control socket:  $cmd\n";
         $ret = "Unrecognized command \"$cmd\"\n";
