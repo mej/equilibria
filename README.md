@@ -15,9 +15,11 @@ a many-year hiatus) and needs some work to flesh it out to be usable
 for what I now need it to do; additional documentation will be added
 once this first round of improvements are in place.
 
+
 ## Quick Start
 
 Syntax:
+
 
 `# equilibria [listener_address:]listener_port>>>target_address:target_port,target_address:target_port,...`
 
@@ -32,7 +34,6 @@ The listening socket is entirely separate from the target socket, so
 specifying different families for each is fully supported.  For
 example, an IPv6 listening socket can proxy to an IPv4, IPv6, or even
 UNIX socket, and vice versa.
-
 
 
 ## TODO
