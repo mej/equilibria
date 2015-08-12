@@ -26,4 +26,17 @@ incoming connection will choose one of the subsequent
 `target_address:target_port` combinations to forward to.
 
 
+## TODO
+
+* Add new capabilities to the control socket for doing runtime
+  manipulation of listeners and targets.
+* Unify the control socket handling in multi-fork mode so the user
+  only needs to interact with the primary daemon instead of having
+  each daemon have its own independent control socket.
+* Packet socket support (i.e., AF_PACKET) to enable raw socket
+  proxying.
+* Add loadable module support for pluggable target selection rather
+  than hard-coding the current choose-at-random algorithm.
+
+
 [![Join the chat at https://gitter.im/mej/equilibria](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/mej/equilibria?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
