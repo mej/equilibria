@@ -37,6 +37,14 @@ incoming connection will choose one of the subsequent
   proxying.
 * Add loadable module support for pluggable target selection rather
   than hard-coding the current choose-at-random algorithm.
+* Add support for Docker integration so that target identities can be
+  automatically ascertained via Docker REST queries instead of
+  hard-coded addresses or DNS lookups.  Should also be dynamically
+  updated.
+* Add support for SSL sockets for secure tunneling of otherwise
+  insecure/vulnerable protocols.  Potential alternative to stunnel,
+  SSH tunneling, etc.
+
 
 
 [![Join the chat at https://gitter.im/mej/equilibria](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/mej/equilibria?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
