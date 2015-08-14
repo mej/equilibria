@@ -37,28 +37,36 @@ use Storable ();
 my ($PROGNAME, $VERSION) = ("equilibria", "1.1");
 my $CONFIG_FILE = "/etc/$PROGNAME/$PROGNAME.conf";
 my ($DEBUG, $LOGFILE, $SOCKETDIR) = (0, "", "");
-my $INET_SOCK_CLASS = "";
+my ($INET_SOCK_CLASS, $SSL_SOCK_CLASS) = ("", "");
 my %OPTION;
 my %data;
 
-eval {
-    require IO::Socket::IP;
-    IO::Socket::IP->import("-register");
-    $INET_SOCK_CLASS = "IO::Socket::IP";
-};
-if ($@) {
-    print "Unable to load IO::Socket::IP -- $@.  Falling back on IO::Socket::INET6.\n";
+BEGIN {
     eval {
-        require IO::Socket::INET6;
-        IO::Socket::INET6->import();
-        $INET_SOCK_CLASS = "IO::Socket::INET6";
+        require IO::Socket::IP;
+        IO::Socket::IP->import("-register");
+        $INET_SOCK_CLASS = "IO::Socket::IP";
     };
     if ($@) {
-        print "ERROR:  Unable to find any IPv6-aware socket class.  Recommend installing IO::Socket::IP.\n";
-        $INET_SOCK_CLASS = "IO::Socket::INET";
+        print "Unable to load IO::Socket::IP -- $@.  Falling back on IO::Socket::INET6.\n";
+        eval {
+            require IO::Socket::INET6;
+            IO::Socket::INET6->import();
+            $INET_SOCK_CLASS = "IO::Socket::INET6";
+        };
+        if ($@) {
+            print "ERROR:  Unable to find any IPv6-aware socket class.  Recommend installing IO::Socket::IP.\n";
+            $INET_SOCK_CLASS = "IO::Socket::INET";
+        }
+    }
+    eval {
+        require IO::Socket::SSL;
+        $SSL_SOCK_CLASS = "IO::Socket::SSL";
+    };
+    if ($@) {
+        print "Unable to load IO::Socket::SSL -- $@.  Secure sockets will not be available.\n";
     }
 }
-
 
 #################### Mezzanine::Util 1.70 (2008-09-18) ######################
 # Debugging output
